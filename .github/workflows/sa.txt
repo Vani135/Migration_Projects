@@ -1,0 +1,610 @@
+
+name: "Project — Create Service Account & Manage IAM Bindings"
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Name of Application"
+        required: true
+        type: string
+      team_name:
+        description: "Name of Team"
+        required: true
+        type: string
+      cost_center:
+        description: "Cost Center"
+        required: true
+        type: string
+      project_id:
+        description: "GCP project ID where the service account will be created"
+        required: true
+        type: string
+      service_account_name:
+        description: "Service account name (lowercase, alphanumeric + hyphens; e.g. ml-pipeline-sa)"
+        required: true
+        type: string
+      service_account_display_name:
+        description: "Service account display name (human-readable; e.g. ML Pipeline Service Account)"
+        required: true
+        type: string
+      roles:
+        description: |
+          Comma-separated roles to bind at project level
+          (e.g. roles/viewer,roles/storage.objectAdmin)
+        required: false
+        type: string
+      members:
+        description: |
+          Comma-separated members for the role bindings
+          (e.g. user:email@example.com,serviceAccount:my-sa@project.iam.gserviceaccount.com)
+        required: false
+        type: string
+      resource_type:
+        description: "IAM binding resource type (project | folder | service_account | organization)"
+        required: false
+        type: choice
+        options:
+          - project
+          - folder
+          - service_account
+          - organization
+        default: project
+      resource_id:
+        description: |
+          Resource ID to bind IAM on. Defaults to project_id when resource_type=project.
+          For folder: folder numeric ID. For org: org numeric ID.
+          For service_account: full SA email.
+        required: false
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - non-prod
+          - prod
+        default: non-prod
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+        default: plan
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+# FIX #10: Added inputs.environment to concurrency group so non-prod and prod
+# runs for the same SA name do not cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.service_account_name }}-${{ inputs.environment }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Print inputs ──────────────────────────────────────────────────────────
+  print-params:
+    name: print input parameters
+    runs-on: ubuntu-latest
+    steps:
+      - name: print inputs
+        run: |
+          SA_KEY="${{ inputs.service_account_name }}"
+          SA_KEY="${SA_KEY//-/_}"
+          SA_EMAIL="${{ inputs.service_account_name }}@${{ inputs.project_id }}.iam.gserviceaccount.com"
+          RESOURCE_ID="${{ inputs.resource_id }}"
+          if [ -z "${RESOURCE_ID}" ]; then RESOURCE_ID="${{ inputs.project_id }}"; fi
+          echo "========================================================"
+          echo "  CREATE SERVICE ACCOUNT & IAM BINDINGS — INPUT PARAMETERS"
+          echo "========================================================"
+          echo "  project_id              : ${{ inputs.project_id }}"
+          echo "  service_account_name    : ${{ inputs.service_account_name }}"
+          echo "  service_account_display : ${{ inputs.service_account_display_name }}"
+          echo "  app_name                : ${{ inputs.app_name }}"
+          echo "  team_name               : ${{ inputs.team_name }}"
+          echo "  cost_center             : ${{ inputs.cost_center }}"
+          echo "  roles                   : ${{ inputs.roles }}"
+          echo "  members                 : ${{ inputs.members }}"
+          echo "  resource_type           : ${{ inputs.resource_type }}"
+          echo "  resource_id             : ${RESOURCE_ID}"
+          echo "  environment             : ${{ inputs.environment }}"
+          echo "  action                  : ${{ inputs.action }}"
+          echo "  triggered by            : ${{ github.actor }}"
+          echo "  run id                  : ${{ github.run_id }}"
+          echo "  ref                     : ${{ github.ref }}"
+          echo ""
+          echo "  Derived Terraform key:"
+          echo "    sa_key        : ${SA_KEY}"
+          echo "  Computed email:"
+          echo "    sa_email      : ${SA_EMAIL}"
+          echo ""
+          CENTRAL_BUCKET="h100-tf-state-np-0005"
+          if [ "${{ inputs.environment }}" = "prod" ]; then CENTRAL_BUCKET="h100-tf-state-prod-0005"; fi
+          echo "  State:"
+          echo "    bucket : ${CENTRAL_BUCKET}  (project: h100-bootstrap-0005)"
+          echo "    prefix : iam/${{ inputs.service_account_name }}"
+          echo "========================================================"
+
+  # ── 2. Terraform plan ────────────────────────────────────────────────────────
+  plan:
+    name: terraform plan — ${{ inputs.environment }} / ${{ inputs.service_account_name }}
+    needs: print-params
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: environments/iam
+    env:
+      PROJECT_ID:    ${{ inputs.project_id }}
+      SA_NAME:       ${{ inputs.service_account_name }}
+      SA_DISPLAY:    ${{ inputs.service_account_display_name }}
+      ENVIRONMENT:   ${{ inputs.environment }}
+      ACTION:        ${{ inputs.action }}
+      TEAM_NAME:     ${{ inputs.team_name }}
+      APP_NAME:      ${{ inputs.app_name }}
+      COST_CENTER:   ${{ inputs.cost_center }}
+      ROLES:         ${{ inputs.roles }}
+      MEMBERS:       ${{ inputs.members }}
+      RESOURCE_TYPE: ${{ inputs.resource_type }}
+      RESOURCE_ID:   ${{ inputs.resource_id }}
+      TF_SA_EMAIL:   sa-kcc-org@h100-bootstrap-0005.iam.gserviceaccount.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: derive terraform key
+        run: |
+          SA_KEY="${SA_NAME//-/_}"
+          echo "SA_KEY=${SA_KEY}" >> "$GITHUB_ENV"
+          EFFECTIVE_RESOURCE_ID="${RESOURCE_ID}"
+          if [ -z "${EFFECTIVE_RESOURCE_ID}" ]; then EFFECTIVE_RESOURCE_ID="${PROJECT_ID}"; fi
+          echo "EFFECTIVE_RESOURCE_ID=${EFFECTIVE_RESOURCE_ID}" >> "$GITHUB_ENV"
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/145810318886/locations/global/workloadIdentityPools/prism-github-actions-pool/providers/prism-github-actions-provider
+          service_account: sa-github-prism-cd@h100-bootstrap-0005.iam.gserviceaccount.com
+
+      - name: set auth to TF IAC SA
+        run: |
+          gcloud config set auth/impersonate_service_account ${TF_SA_EMAIL}
+          echo "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=${TF_SA_EMAIL}" >> "$GITHUB_ENV"
+
+      - name: resolve state bucket
+        run: |
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            ACTIVE_STATE_BUCKET="h100-tf-state-prod-0005"
+          else
+            ACTIVE_STATE_BUCKET="h100-tf-state-np-0005"
+          fi
+          echo "State stored in central gs://${ACTIVE_STATE_BUCKET}"
+          echo "ACTIVE_STATE_BUCKET=${ACTIVE_STATE_BUCKET}" >> "$GITHUB_ENV"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.9"
+
+      - name: generate service account and IAM vars
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys
+
+          proj          = os.environ['PROJECT_ID']
+          sa_name       = os.environ['SA_NAME']
+          sa_display    = os.environ['SA_DISPLAY']
+          sa_key        = os.environ['SA_KEY']
+          team_name     = os.environ['TEAM_NAME'].lower().replace(' ', '-')
+          app_name      = os.environ['APP_NAME'].lower().replace(' ', '-')
+          cost_center   = os.environ['COST_CENTER'].lower().replace(' ', '-')
+          env           = os.environ['ENVIRONMENT']
+          roles_raw     = os.environ.get('ROLES', '')
+          members_raw   = os.environ.get('MEMBERS', '')
+          resource_type = os.environ.get('RESOURCE_TYPE', 'project')
+          resource_id   = os.environ.get('EFFECTIVE_RESOURCE_ID', proj)
+
+          sa_cfg = {
+              "project":      proj,
+              "account_id":   sa_name,
+              "display_name": sa_display,
+              "description":  f"Service account for {app_name} ({team_name})",
+          }
+
+          roles_list   = [r.strip() for r in roles_raw.split(',')   if r.strip()]
+          members_list = [m.strip() for m in members_raw.split(',') if m.strip()]
+
+          # FIX #7: Warn clearly when no IAM bindings will be created.
+          if not roles_list or not members_list:
+              print("WARNING: roles or members is empty — no IAM bindings will be created.", flush=True)
+
+          iam_bindings = {}
+          for role in roles_list:
+              role_slug = role.replace('/', '').replace(':', '')
+              for member in members_list:
+                  member_slug = (member.replace(':', '').replace('@', '_at')
+                                       .replace('.', '').replace('/', ''))
+                  key = f"{sa_key}{role_slug}{member_slug}"
+                  iam_bindings[key] = {
+                      "role":          role,
+                      "member":        member,
+                      "resource_id":   resource_id,
+                      "resource_type": resource_type,
+                  }
+
+          config = {
+              "project_id":       proj,
+              "service_accounts": {sa_key: sa_cfg},
+              "iam_bindings":     iam_bindings,
+              "labels": {
+                  "app":         app_name,
+                  "cost-center": cost_center,
+                  "env":         env,
+                  "managed-by":  "terraform",
+                  "team":        team_name,
+              },
+          }
+
+          with open('vars.auto.tfvars.json', 'w') as f:
+              json.dump(config, f, indent=2)
+          print(json.dumps(config, indent=2))
+          PYEOF
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ github.workspace }}
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${ACTIVE_STATE_BUCKET}" \
+            -backend-config="prefix=iam/${SA_NAME}"
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var="terraform_sa_email=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: fail on plan error
+        if: ${{ steps.plan.outputs.exit_code != '0' }}
+        run: exit ${{ steps.plan.outputs.exit_code }}
+
+      # FIX #4: Publish plan output to the job summary so approvers can see
+      # exactly what will be applied before they approve the gate.
+      - name: post plan to job summary
+        if: always()
+        run: |
+          echo "## Terraform Plan — \${{ inputs.service_account_name }}\ / \${{ inputs.environment }}\" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo 'terraform' >> $GITHUB_STEP_SUMMARY
+          cat plan_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+
+      # FIX #3: Upload the tfplan binary so the apply job uses the exact same
+      # plan that was reviewed — preventing drift between plan and apply.
+      - name: upload tfplan artifact
+        if: ${{ steps.plan.outputs.exit_code == '0' && inputs.action == 'apply' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.service_account_name }}-${{ inputs.environment }}
+          path: |
+            environments/iam/tfplan
+            environments/iam/vars.auto.tfvars.json
+          retention-days: 1
+
+  # ── 3. Apply approval gate ───────────────────────────────────────────────────
+  approve:
+    name: approve apply — ${{ inputs.environment }} / ${{ inputs.service_account_name }}
+    needs: plan
+    if: ${{ inputs.action == 'apply' }}
+    runs-on: ubuntu-latest
+    environment: approve-gate
+    steps:
+      - name: apply approved
+        run: |
+          RESOURCE_ID="${{ inputs.resource_id }}"
+          if [ -z "${RESOURCE_ID}" ]; then RESOURCE_ID="${{ inputs.project_id }}"; fi
+          echo "========================================================"
+          echo "  APPLY APPROVED"
+          echo "========================================================"
+          echo "  service_account_name    : ${{ inputs.service_account_name }}"
+          echo "  service_account_display : ${{ inputs.service_account_display_name }}"
+          echo "  project_id              : ${{ inputs.project_id }}"
+          echo "  roles                   : ${{ inputs.roles }}"
+          echo "  members                 : ${{ inputs.members }}"
+          echo "  resource_type           : ${{ inputs.resource_type }}"
+          echo "  resource_id             : ${RESOURCE_ID}"
+          echo "  environment             : ${{ inputs.environment }}"
+          echo "  approved by             : ${{ github.actor }}"
+          echo "  run id                  : ${{ github.run_id }}"
+          echo "========================================================"
+
+  # ── 4. Terraform apply ───────────────────────────────────────────────────────
+  apply:
+    name: terraform apply — ${{ inputs.environment }} / ${{ inputs.service_account_name }}
+    needs: approve
+    if: ${{ inputs.action == 'apply' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: environments/iam
+    env:
+      PROJECT_ID:    ${{ inputs.project_id }}
+      SA_NAME:       ${{ inputs.service_account_name }}
+      # FIX #1: SA_DISPLAY was missing from the apply job env block entirely,
+      # causing a KeyError in the Python script and update-tfvars step.
+      SA_DISPLAY:    ${{ inputs.service_account_display_name }}
+      ENVIRONMENT:   ${{ inputs.environment }}
+      TEAM_NAME:     ${{ inputs.team_name }}
+      APP_NAME:      ${{ inputs.app_name }}
+      COST_CENTER:   ${{ inputs.cost_center }}
+      ROLES:         ${{ inputs.roles }}
+      MEMBERS:       ${{ inputs.members }}
+      RESOURCE_TYPE: ${{ inputs.resource_type }}
+      RESOURCE_ID:   ${{ inputs.resource_id }}
+      TF_SA_EMAIL:   sa-kcc-org@h100-bootstrap-0005.iam.gserviceaccount.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: derive terraform key
+        run: |
+          SA_KEY="${SA_NAME//-/_}"
+          echo "SA_KEY=${SA_KEY}" >> "$GITHUB_ENV"
+          EFFECTIVE_RESOURCE_ID="${RESOURCE_ID}"
+          if [ -z "${EFFECTIVE_RESOURCE_ID}" ]; then EFFECTIVE_RESOURCE_ID="${PROJECT_ID}"; fi
+          echo "EFFECTIVE_RESOURCE_ID=${EFFECTIVE_RESOURCE_ID}" >> "$GITHUB_ENV"
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/145810318886/locations/global/workloadIdentityPools/prism-github-actions-pool/providers/prism-github-actions-provider
+          service_account: sa-github-prism-cd@h100-bootstrap-0005.iam.gserviceaccount.com
+
+      - name: set auth to TF IAC SA
+        run: |
+          gcloud config set auth/impersonate_service_account ${TF_SA_EMAIL}
+          echo "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=${TF_SA_EMAIL}" >> "$GITHUB_ENV"
+
+      - name: resolve state bucket
+        run: |
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            ACTIVE_STATE_BUCKET="h100-tf-state-prod-0005"
+          else
+            ACTIVE_STATE_BUCKET="h100-tf-state-np-0005"
+          fi
+          echo "State stored in central gs://${ACTIVE_STATE_BUCKET}"
+          echo "ACTIVE_STATE_BUCKET=${ACTIVE_STATE_BUCKET}" >> "$GITHUB_ENV"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.9"
+
+      # FIX #3: Download the exact tfplan produced in the plan job so apply
+      # executes the same changes that were reviewed and approved.
+      - name: download tfplan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.service_account_name }}-${{ inputs.environment }}
+          path: environments/iam/
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${ACTIVE_STATE_BUCKET}" \
+            -backend-config="prefix=iam/${SA_NAME}"
+
+      - name: import service account if exists
+        run: |
+          STATE_ID="module.iam.google_service_account.accounts[\"${SA_KEY}\"]"
+          SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+          # FIX #8: Pass --impersonate-service-account explicitly so this check
+          # does not silently succeed/fail if gcloud impersonation is not active.
+          if gcloud iam service-accounts describe "${SA_EMAIL}" \
+              --project="${PROJECT_ID}" \
+              --impersonate-service-account="${TF_SA_EMAIL}" \
+              >/dev/null 2>&1; then
+            if terraform state show "${STATE_ID}" >/dev/null 2>&1; then
+              echo "Service account ${SA_EMAIL} already in state — skipping import."
+            else
+              echo "Service account ${SA_EMAIL} exists in project — importing into state..."
+              terraform import \
+                -var="terraform_sa_email=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}" \
+                "${STATE_ID}" "projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}"
+            fi
+          else
+            echo "Service account ${SA_EMAIL} does not exist — Terraform will create it."
+          fi
+
+      # FIX #3: Apply the pre-approved plan binary directly; no -auto-approve
+      # with a fresh plan — this guarantees apply matches what was reviewed.
+      - name: terraform apply
+        id: apply
+        run: |
+          set +e
+          terraform apply \
+            -var="terraform_sa_email=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}" \
+            -input=false \
+            -no-color \
+            tfplan 2>&1 | tee apply_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: fail on apply error
+        if: ${{ steps.apply.outputs.exit_code != '0' }}
+        run: exit ${{ steps.apply.outputs.exit_code }}
+
+      - name: summary
+        run: |
+          SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+          echo "========================================================"
+          echo "  SERVICE ACCOUNT & IAM BINDINGS APPLIED SUCCESSFULLY"
+          echo "========================================================"
+          echo "  Service Account Email  : ${SA_EMAIL}"
+          echo "  Service Account Name   : ${{ inputs.service_account_name }}"
+          echo "  Project ID             : ${{ inputs.project_id }}"
+          echo "  Roles                  : ${{ inputs.roles }}"
+          echo "  Members                : ${{ inputs.members }}"
+          echo "  Resource Type          : ${{ inputs.resource_type }}"
+          echo "  Resource ID            : ${EFFECTIVE_RESOURCE_ID}"
+          echo "========================================================"
+
+          # Post apply output to job summary as well
+          echo "## Terraform Apply — \${{ inputs.service_account_name }}\ / \${{ inputs.environment }}\" >> $GITHUB_STEP_SUMMARY
+          echo 'terraform' >> $GITHUB_STEP_SUMMARY
+          cat apply_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+
+      - name: update terraform.tfvars
+        run: |
+          export TFVARS_PATH="${{ github.workspace }}/environments/${ENVIRONMENT}/terraform.tfvars"
+          python3 << 'PYEOF'
+          import os, re
+
+          path          = os.environ['TFVARS_PATH']
+          sa_key        = os.environ['SA_KEY']
+          sa_name       = os.environ['SA_NAME']
+          sa_display    = os.environ['SA_DISPLAY']
+          proj          = os.environ['PROJECT_ID']
+          team_name     = os.environ['TEAM_NAME'].lower().replace(' ', '-')
+          app_name      = os.environ['APP_NAME'].lower().replace(' ', '-')
+          roles_raw     = os.environ.get('ROLES', '')
+          members_raw   = os.environ.get('MEMBERS', '')
+          resource_type = os.environ.get('RESOURCE_TYPE', 'project')
+          resource_id   = os.environ.get('EFFECTIVE_RESOURCE_ID', proj)
+
+          # FIX #2: Handle missing terraform.tfvars gracefully on first run
+          # instead of crashing with FileNotFoundError.
+          if os.path.exists(path):
+              content = open(path).read()
+          else:
+              print(f"  {path} not found — will create it.")
+              content = ""
+
+          roles_list   = [r.strip() for r in roles_raw.split(',')   if r.strip()]
+          members_list = [m.strip() for m in members_raw.split(',') if m.strip()]
+
+          sa_entry = (
+              f'  {sa_key} = {{\n'
+              f'    project      = "{proj}"\n'
+              f'    account_id   = "{sa_name}"\n'
+              f'    display_name = "{sa_display}"\n'
+              f'    description  = "Service account for {app_name} ({team_name})"\n'
+              f'  }}'
+          )
+
+          iam_entries = {}
+          for role in roles_list:
+              role_slug = role.replace('/', '').replace(':', '')
+              for member in members_list:
+                  member_slug = (member.replace(':', '').replace('@', '_at')
+                                       .replace('.', '').replace('/', ''))
+                  key = f"{sa_key}{role_slug}{member_slug}"
+                  iam_entries[key] = (
+                      f'  {key} = {{\n'
+                      f'    role          = "{role}"\n'
+                      f'    member        = "{member}"\n'
+                      f'    resource_id   = "{resource_id}"\n'
+                      f'    resource_type = "{resource_type}"\n'
+                      f'  }}'
+                  )
+
+          def insert_into_map(content, map_name, new_entry, key):
+              if re.search(rf'^\s+{re.escape(key)}\s*=', content, re.MULTILINE):
+                  print(f'  {key} already in {map_name}')
+                  return content
+              single = re.compile(rf'^([ \t]{re.escape(map_name)}[ \t]=[ \t]\{{[ \t]\}})', re.MULTILINE)
+              if single.search(content):
+                  content = single.sub(f'{map_name} = {{\n{new_entry}\n}}', content)
+                  print(f'  Added {key} to {map_name} (expanded empty map)')
+                  return content
+              if not re.search(rf'^\s*{re.escape(map_name)}\s*=\s*\{{', content, re.MULTILINE):
+                  content = content.rstrip('\n') + f'\n\n{map_name} = {{\n{new_entry}\n}}\n'
+                  print(f'  Added {key} to {map_name} (new map)')
+                  return content
+              lines = content.splitlines(keepends=True)
+              in_map, depth = False, 0
+              for i, line in enumerate(lines):
+                  stripped = line.strip()
+                  if not in_map:
+                      if re.match(rf'\s*{re.escape(map_name)}\s*=\s*\{{', line):
+                          in_map, depth = True, stripped.count('{') - stripped.count('}')
+                  else:
+                      depth += stripped.count('{') - stripped.count('}')
+                      if depth == 0:
+                          lines.insert(i, new_entry + '\n')
+                          print(f'  Added {key} to {map_name}')
+                          break
+              return ''.join(lines)
+
+          content = insert_into_map(content, 'service_accounts', sa_entry, sa_key)
+
+          for key, entry in iam_entries.items():
+              content = insert_into_map(content, 'iam_bindings', entry, key)
+
+          # FIX #2: Ensure parent directory exists before writing
+          os.makedirs(os.path.dirname(path), exist_ok=True)
+          open(path, 'w').write(content)
+          print('terraform.tfvars updated.')
+          PYEOF
+
+          # FIX #6: Run fmt on the tfvars file after writing it so formatting
+          # is consistent with what fmt -check verifies during plan.
+          terraform fmt "${{ github.workspace }}/environments/${ENVIRONMENT}/terraform.tfvars"
+
+      - name: commit and push terraform.tfvars
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "${{ github.workspace }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git add "environments/${ENVIRONMENT}/terraform.tfvars"
+          if git diff --cached --quiet; then
+            echo "No changes — entries already present in terraform.tfvars."
+          else
+            git commit -m "[skip ci] add SA ${SA_NAME} and IAM bindings to ${ENVIRONMENT}/terraform.tfvars"
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              # FIX #5: Use fetch + rebase against the remote branch instead of
+              # a blind pull --rebase to avoid dirty-state issues on retry.
+              git fetch origin
+              if git rebase origin/${{ github.ref_name }} && git push; then
+                echo "Pushed terraform.tfvars update."
+                exit 0
+              else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                echo "Retry $RETRY_COUNT/$MAX_RETRIES: push failed, resetting and retrying..."
+                git rebase --abort 2>/dev/null || true
+                git reset --soft HEAD~1
+                git stash
+                git fetch origin
+                git rebase origin/${{ github.ref_name }}
+                git stash pop
+                git add "environments/${ENVIRONMENT}/terraform.tfvars"
+                git commit -m "[skip ci] add SA ${SA_NAME} and IAM bindings to ${ENVIRONMENT}/terraform.tfvars"
+                sleep 5
+              fi
+            done
+            echo "Failed to push after $MAX_RETRIES retries"
+            exit 1
+          fi
