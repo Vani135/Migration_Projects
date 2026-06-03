@@ -1,0 +1,599 @@
+name: "Project — Create-Firewall-Rule"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Name of Application"
+        required: true
+        type: string
+      team_name:
+        description: "Name of Team"
+        required: true
+        type: string
+      cost_center:
+        description: "Cost Center"
+        required: true
+        type: string
+      project_id:
+        description: "GCP project ID where the firewall rule will be created"
+        required: true
+        type: string
+      vpc_key:
+        description: "VPC key as defined in var.vpcs (e.g. main-vpc)"
+        required: true
+        type: string
+      rule_name:
+        description: "Firewall rule name (lowercase, alphanumeric + hyphens; e.g. allow-iap-ssh)"
+        required: true
+        type: string
+      direction:
+        description: "Traffic direction"
+        required: true
+        type: choice
+        options:
+          - INGRESS
+          - EGRESS
+        default: INGRESS
+      protocol:
+        description: "Protocol (tcp / udp / icmp / all)"
+        required: true
+        type: string
+        default: "tcp"
+      ports:
+        description: "Comma-separated ports or ranges (e.g. 443,8080-8090). Leave blank for all ports."
+        required: false
+        type: string
+        default: ""
+      source_ranges:
+        description: "Comma-separated source CIDR ranges for INGRESS (e.g. 10.0.0.0/8,35.235.240.0/20). Leave blank for none."
+        required: false
+        type: string
+        default: ""
+      destination_ranges:
+        description: "Comma-separated destination CIDR ranges for EGRESS. Leave blank for none."
+        required: false
+        type: string
+        default: ""
+      source_tags:
+        description: "Comma-separated source network tags (INGRESS only). Leave blank for none."
+        required: false
+        type: string
+        default: ""
+      target_tags:
+        description: "Comma-separated target network tags. Leave blank for all instances."
+        required: false
+        type: string
+        default: ""
+      target_service_accounts:
+        description: "Comma-separated target service accounts for scoped targeting. Leave blank for none."
+        required: false
+        type: string
+        default: ""
+      priority:
+        description: "Rule priority (0–65534; lower = higher priority)"
+        required: false
+        type: string
+        default: "1000"
+      rule_action:
+        description: "Allow or Deny traffic matching this rule"
+        required: true
+        type: choice
+        options:
+          - allow
+          - deny
+        default: allow
+      enable_logging:
+        description: "Enable firewall logging"
+        required: false
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      description:
+        description: "Human-readable description of this firewall rule"
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - non-prod
+          - prod
+        default: non-prod
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+        default: plan
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.rule_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Print inputs ──────────────────────────────────────────────────────────
+  print-params:
+    name: print input parameters
+    runs-on: self-hosted
+    steps:
+      - name: print inputs
+        run: |
+          RULE_KEY="${{ inputs.rule_name }}"
+          RULE_KEY="${RULE_KEY//-/_}"
+          echo "========================================================"
+          echo "  CREATE FIREWALL RULE — INPUT PARAMETERS"
+          echo "========================================================"
+          echo "  project_id              : ${{ inputs.project_id }}"
+          echo "  rule_name               : ${{ inputs.rule_name }}"
+          echo "  vpc_key                 : ${{ inputs.vpc_key }}"
+          echo "  direction               : ${{ inputs.direction }}"
+          echo "  rule_action             : ${{ inputs.rule_action }}"
+          echo "  protocol                : ${{ inputs.protocol }}"
+          echo "  ports                   : ${{ inputs.ports }}"
+          echo "  source_ranges           : ${{ inputs.source_ranges }}"
+          echo "  destination_ranges      : ${{ inputs.destination_ranges }}"
+          echo "  source_tags             : ${{ inputs.source_tags }}"
+          echo "  target_tags             : ${{ inputs.target_tags }}"
+          echo "  target_service_accounts : ${{ inputs.target_service_accounts }}"
+          echo "  priority                : ${{ inputs.priority }}"
+          echo "  enable_logging          : ${{ inputs.enable_logging }}"
+          echo "  description             : ${{ inputs.description }}"
+          echo "  app_name                : ${{ inputs.app_name }}"
+          echo "  team_name               : ${{ inputs.team_name }}"
+          echo "  cost_center             : ${{ inputs.cost_center }}"
+          echo "  environment             : ${{ inputs.environment }}"
+          echo "  action                  : ${{ inputs.action }}"
+          echo "  triggered by            : ${{ github.actor }}"
+          echo "  run id                  : ${{ github.run_id }}"
+          echo "  ref                     : ${{ github.ref }}"
+          echo ""
+          echo "  Derived Terraform key   : ${RULE_KEY}"
+          CENTRAL_BUCKET="h100-tf-state-np-0005"
+          if [ "${{ inputs.environment }}" = "prod" ]; then CENTRAL_BUCKET="h100-tf-state-prod-0005"; fi
+          echo "  State bucket             : ${CENTRAL_BUCKET}  (project: h100-bootstrap-0005)"
+          echo "  State prefix             : networking/${{ inputs.rule_name }}"
+          echo "========================================================"
+
+  # ── 2. Terraform plan ────────────────────────────────────────────────────────
+  plan:
+    name: terraform plan — ${{ inputs.environment }} / ${{ inputs.rule_name }}
+    needs: print-params
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: environments/networking
+    env:
+      PROJECT_ID:                ${{ inputs.project_id }}
+      RULE_NAME:                 ${{ inputs.rule_name }}
+      VPC_KEY:                   ${{ inputs.vpc_key }}
+      DIRECTION:                 ${{ inputs.direction }}
+      RULE_ACTION:               ${{ inputs.rule_action }}
+      PROTOCOL:                  ${{ inputs.protocol }}
+      PORTS:                     ${{ inputs.ports }}
+      SOURCE_RANGES:             ${{ inputs.source_ranges }}
+      DESTINATION_RANGES:        ${{ inputs.destination_ranges }}
+      SOURCE_TAGS:               ${{ inputs.source_tags }}
+      TARGET_TAGS:               ${{ inputs.target_tags }}
+      TARGET_SERVICE_ACCOUNTS:   ${{ inputs.target_service_accounts }}
+      PRIORITY:                  ${{ inputs.priority }}
+      ENABLE_LOGGING:            ${{ inputs.enable_logging }}
+      DESCRIPTION:               ${{ inputs.description }}
+      ENVIRONMENT:               ${{ inputs.environment }}
+      TEAM_NAME:                 ${{ inputs.team_name }}
+      APP_NAME:                  ${{ inputs.app_name }}
+      COST_CENTER:               ${{ inputs.cost_center }}
+      TF_SA_EMAIL:               sa-kcc-org@h100-bootstrap-0005.iam.gserviceaccount.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: derive terraform key
+        run: |
+          RULE_KEY="${RULE_NAME//-/_}"
+          echo "RULE_KEY=${RULE_KEY}" >> "$GITHUB_ENV"
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            echo "STATE_BUCKET=h100-tf-state-prod-0005" >> "$GITHUB_ENV"
+          else
+            echo "STATE_BUCKET=h100-tf-state-np-0005"   >> "$GITHUB_ENV"
+          fi
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/145810318886/locations/global/workloadIdentityPools/prism-github-actions-pool/providers/prism-github-actions-provider
+          service_account: sa-github-prism-cd@h100-bootstrap-0005.iam.gserviceaccount.com
+      - name: set auth to TF IAC SA
+        run: |
+          gcloud config set auth/impersonate_service_account ${TF_SA_EMAIL}
+          echo "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=${TF_SA_EMAIL}" >> "$GITHUB_ENV"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.9"
+      - name: generate firewall rule vars
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          def csv_to_list(val):
+              return [v.strip() for v in val.split(',') if v.strip()] if val.strip() else []
+
+          proj          = os.environ['PROJECT_ID']
+          rule_name     = os.environ['RULE_NAME']
+          rule_key      = os.environ['RULE_KEY']
+          vpc_key       = os.environ['VPC_KEY']
+          direction     = os.environ['DIRECTION']
+          rule_action   = os.environ['RULE_ACTION']
+          protocol      = os.environ['PROTOCOL']
+          ports         = csv_to_list(os.environ['PORTS'])
+          source_ranges = csv_to_list(os.environ['SOURCE_RANGES'])
+          dest_ranges   = csv_to_list(os.environ['DESTINATION_RANGES'])
+          source_tags   = csv_to_list(os.environ['SOURCE_TAGS'])
+          target_tags   = csv_to_list(os.environ['TARGET_TAGS'])
+          target_sas    = csv_to_list(os.environ.get('TARGET_SERVICE_ACCOUNTS', ''))
+          priority      = int(os.environ['PRIORITY'])
+          enable_log    = os.environ['ENABLE_LOGGING'].lower() == 'true'
+          description   = os.environ.get('DESCRIPTION', '')
+          team_name     = os.environ['TEAM_NAME'].lower().replace(' ', '-')
+          app_name      = os.environ['APP_NAME'].lower().replace(' ', '-')
+          cost_center   = os.environ['COST_CENTER'].lower().replace(' ', '-')
+          env           = os.environ['ENVIRONMENT']
+
+          action_block = {"protocol": protocol, "ports": ports}
+
+          rule_cfg = {
+              "project":                  proj,
+              "name":                     rule_name,
+              "vpc_key":                  vpc_key,
+              "direction":                direction,
+              "priority":                 priority,
+              "description":              description or f"Firewall rule {rule_name} for {app_name} ({team_name})",
+              "source_ranges":            source_ranges,
+              "destination_ranges":       dest_ranges,
+              "source_tags":              source_tags,
+              "target_tags":              target_tags,
+              "target_service_accounts":  target_sas,
+              "allow":                    [action_block] if rule_action == "allow" else [],
+              "deny":                     [action_block] if rule_action == "deny"  else [],
+              "log_config":               {"metadata": "INCLUDE_ALL_METADATA"} if enable_log else None,
+          }
+
+          config = {
+              "project_id":     proj,
+              "firewall_rules": {rule_key: rule_cfg},
+              "labels": {
+                  "app":         app_name,
+                  "cost-center": cost_center,
+                  "env":         env,
+                  "managed-by":  "terraform",
+                  "team":        team_name,
+              },
+          }
+
+          with open('vars.auto.tfvars.json', 'w') as f:
+              json.dump(config, f, indent=2)
+          print(json.dumps(config, indent=2))
+          PYEOF
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ github.workspace }}
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="prefix=networking/${RULE_NAME}"
+      - name: terraform validate
+        run: terraform validate
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var="terraform_sa_email=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}" \
+            -target="module.networking.google_compute_firewall.rules[\"${RULE_KEY}\"]" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - name: fail on plan error
+        if: ${{ steps.plan.outputs.exit_code != '0' }}
+        run: exit ${{ steps.plan.outputs.exit_code }}
+
+  # ── 3. Apply approval gate ───────────────────────────────────────────────────
+  approve:
+    name: approve apply — ${{ inputs.environment }} / ${{ inputs.rule_name }}
+    needs: plan
+    if: ${{ inputs.action == 'apply' }}
+    runs-on: self-hosted
+    environment: approve-gate
+    steps:
+      - name: apply approved
+        run: |
+          echo "========================================================"
+          echo "  APPLY APPROVED"
+          echo "========================================================"
+          echo "  rule_name   : ${{ inputs.rule_name }}"
+          echo "  vpc_key     : ${{ inputs.vpc_key }}"
+          echo "  project_id  : ${{ inputs.project_id }}"
+          echo "  environment : ${{ inputs.environment }}"
+          echo "  approved by : ${{ github.actor }}"
+          echo "  run id      : ${{ github.run_id }}"
+          echo "========================================================"
+
+  # ── 4. Terraform apply ───────────────────────────────────────────────────────
+  apply:
+    name: terraform apply — ${{ inputs.environment }} / ${{ inputs.rule_name }}
+    needs: approve
+    if: ${{ inputs.action == 'apply' }}
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: environments/networking
+    env:
+      PROJECT_ID:                ${{ inputs.project_id }}
+      RULE_NAME:                 ${{ inputs.rule_name }}
+      VPC_KEY:                   ${{ inputs.vpc_key }}
+      DIRECTION:                 ${{ inputs.direction }}
+      RULE_ACTION:               ${{ inputs.rule_action }}
+      PROTOCOL:                  ${{ inputs.protocol }}
+      PORTS:                     ${{ inputs.ports }}
+      SOURCE_RANGES:             ${{ inputs.source_ranges }}
+      DESTINATION_RANGES:        ${{ inputs.destination_ranges }}
+      SOURCE_TAGS:               ${{ inputs.source_tags }}
+      TARGET_TAGS:               ${{ inputs.target_tags }}
+      TARGET_SERVICE_ACCOUNTS:   ${{ inputs.target_service_accounts }}
+      PRIORITY:                  ${{ inputs.priority }}
+      ENABLE_LOGGING:            ${{ inputs.enable_logging }}
+      DESCRIPTION:               ${{ inputs.description }}
+      ENVIRONMENT:               ${{ inputs.environment }}
+      TEAM_NAME:                 ${{ inputs.team_name }}
+      APP_NAME:                  ${{ inputs.app_name }}
+      COST_CENTER:               ${{ inputs.cost_center }}
+      TF_SA_EMAIL:               sa-kcc-org@h100-bootstrap-0005.iam.gserviceaccount.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: derive terraform key
+        run: |
+          RULE_KEY="${RULE_NAME//-/_}"
+          echo "RULE_KEY=${RULE_KEY}" >> "$GITHUB_ENV"
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            echo "STATE_BUCKET=h100-tf-state-prod-0005" >> "$GITHUB_ENV"
+          else
+            echo "STATE_BUCKET=h100-tf-state-np-0005"   >> "$GITHUB_ENV"
+          fi
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/145810318886/locations/global/workloadIdentityPools/prism-github-actions-pool/providers/prism-github-actions-provider
+          service_account: sa-github-prism-cd@h100-bootstrap-0005.iam.gserviceaccount.com
+      - name: set auth to TF IAC SA
+        run: |
+          gcloud config set auth/impersonate_service_account ${TF_SA_EMAIL}
+          echo "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=${TF_SA_EMAIL}" >> "$GITHUB_ENV"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.9"
+      - name: generate firewall rule vars
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          def csv_to_list(val):
+              return [v.strip() for v in val.split(',') if v.strip()] if val.strip() else []
+
+          proj          = os.environ['PROJECT_ID']
+          rule_name     = os.environ['RULE_NAME']
+          rule_key      = os.environ['RULE_KEY']
+          vpc_key       = os.environ['VPC_KEY']
+          direction     = os.environ['DIRECTION']
+          rule_action   = os.environ['RULE_ACTION']
+          protocol      = os.environ['PROTOCOL']
+          ports         = csv_to_list(os.environ['PORTS'])
+          source_ranges = csv_to_list(os.environ['SOURCE_RANGES'])
+          dest_ranges   = csv_to_list(os.environ['DESTINATION_RANGES'])
+          source_tags   = csv_to_list(os.environ['SOURCE_TAGS'])
+          target_tags   = csv_to_list(os.environ['TARGET_TAGS'])
+          target_sas    = csv_to_list(os.environ.get('TARGET_SERVICE_ACCOUNTS', ''))
+          priority      = int(os.environ['PRIORITY'])
+          enable_log    = os.environ['ENABLE_LOGGING'].lower() == 'true'
+          description   = os.environ.get('DESCRIPTION', '')
+          team_name     = os.environ['TEAM_NAME'].lower().replace(' ', '-')
+          app_name      = os.environ['APP_NAME'].lower().replace(' ', '-')
+          cost_center   = os.environ['COST_CENTER'].lower().replace(' ', '-')
+          env           = os.environ['ENVIRONMENT']
+
+          action_block = {"protocol": protocol, "ports": ports}
+
+          rule_cfg = {
+              "project":                  proj,
+              "name":                     rule_name,
+              "vpc_key":                  vpc_key,
+              "direction":                direction,
+              "priority":                 priority,
+              "description":              description or f"Firewall rule {rule_name} for {app_name} ({team_name})",
+              "source_ranges":            source_ranges,
+              "destination_ranges":       dest_ranges,
+              "source_tags":              source_tags,
+              "target_tags":              target_tags,
+              "target_service_accounts":  target_sas,
+              "allow":                    [action_block] if rule_action == "allow" else [],
+              "deny":                     [action_block] if rule_action == "deny"  else [],
+              "log_config":               {"metadata": "INCLUDE_ALL_METADATA"} if enable_log else None,
+          }
+
+          config = {
+              "project_id":     proj,
+              "firewall_rules": {rule_key: rule_cfg},
+              "labels": {
+                  "app":         app_name,
+                  "cost-center": cost_center,
+                  "env":         env,
+                  "managed-by":  "terraform",
+                  "team":        team_name,
+              },
+          }
+
+          with open('vars.auto.tfvars.json', 'w') as f:
+              json.dump(config, f, indent=2)
+          print(json.dumps(config, indent=2))
+          PYEOF
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="prefix=networking/${RULE_NAME}"
+      - name: terraform apply
+        run: |
+          terraform apply \
+            -var="terraform_sa_email=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}" \
+            -target="module.networking.google_compute_firewall.rules[\"${RULE_KEY}\"]" \
+            -auto-approve \
+            -no-color
+      - name: update terraform.tfvars
+        run: |
+          export TFVARS_PATH="${{ github.workspace }}/environments/${ENVIRONMENT}/terraform.tfvars"
+          python3 << 'PYEOF'
+          import os, re
+
+          def csv_to_list(val):
+              return [v.strip() for v in val.split(',') if v.strip()] if val.strip() else []
+
+          path = os.environ['TFVARS_PATH']
+
+          if not os.path.exists(path):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, 'w') as f:
+                  f.write('# Auto-generated by GitHub Actions\n\nfirewall_rules = {}\n')
+              print(f'Created new terraform.tfvars at {path}')
+
+          content       = open(path).read()
+          rule_key      = os.environ['RULE_KEY']
+          rule_name     = os.environ['RULE_NAME']
+          vpc_key       = os.environ['VPC_KEY']
+          direction     = os.environ['DIRECTION']
+          rule_action   = os.environ['RULE_ACTION']
+          protocol      = os.environ['PROTOCOL']
+          ports         = csv_to_list(os.environ['PORTS'])
+          source_ranges = csv_to_list(os.environ['SOURCE_RANGES'])
+          dest_ranges   = csv_to_list(os.environ['DESTINATION_RANGES'])
+          source_tags   = csv_to_list(os.environ['SOURCE_TAGS'])
+          target_tags   = csv_to_list(os.environ['TARGET_TAGS'])
+          target_sas    = csv_to_list(os.environ.get('TARGET_SERVICE_ACCOUNTS', ''))
+          priority      = os.environ['PRIORITY']
+          enable_log    = os.environ['ENABLE_LOGGING'].lower() == 'true'
+          description   = os.environ.get('DESCRIPTION', '')
+          team_name     = os.environ['TEAM_NAME'].lower().replace(' ', '-')
+          app_name      = os.environ['APP_NAME'].lower().replace(' ', '-')
+
+          def hcl_list(items):
+              if not items:
+                  return '[]'
+              quoted = ', '.join(f'"{i}"' for i in items)
+              return f'[{quoted}]'
+
+          def hcl_action_block(action, proto, port_list):
+              ports_hcl = hcl_list(port_list)
+              return (
+                  f'    {action} {{\n'
+                  f'      protocol = "{proto}"\n'
+                  f'      ports    = {ports_hcl}\n'
+                  f'    }}'
+              )
+
+          allow_block = hcl_action_block('allow', protocol, ports) if rule_action == 'allow' else ''
+          deny_block  = hcl_action_block('deny',  protocol, ports) if rule_action == 'deny'  else ''
+          log_block   = '    log_config {\n      metadata = "INCLUDE_ALL_METADATA"\n    }' if enable_log else ''
+
+          desc = description or f"Firewall rule {rule_name} for {app_name} ({team_name})"
+
+          rule_entry_lines = [
+              f'  {rule_key} = {{',
+              f'    project                   = "{os.environ["PROJECT_ID"]}"',
+              f'    name                      = "{rule_name}"',
+              f'    vpc_key                   = "{vpc_key}"',
+              f'    direction                 = "{direction}"',
+              f'    priority                  = {priority}',
+              f'    description               = "{desc}"',
+              f'    source_ranges             = {hcl_list(source_ranges)}',
+              f'    destination_ranges        = {hcl_list(dest_ranges)}',
+              f'    source_tags               = {hcl_list(source_tags)}',
+              f'    target_tags               = {hcl_list(target_tags)}',
+              f'    target_service_accounts   = {hcl_list(target_sas)}',
+          ]
+          if allow_block:
+              rule_entry_lines.append(allow_block)
+          if deny_block:
+              rule_entry_lines.append(deny_block)
+          if log_block:
+              rule_entry_lines.append(log_block)
+          rule_entry_lines.append('  }')
+          rule_entry = '\n'.join(rule_entry_lines)
+
+          def insert_into_map(content, map_name, new_entry, key):
+              if re.search(rf'^\s+{re.escape(key)}\s*=', content, re.MULTILINE):
+                  print(f'  {key} already in {map_name}')
+                  return content
+              single = re.compile(rf'^([ \t]*{re.escape(map_name)}[ \t]*=[ \t]*\{{[ \t]*\}})', re.MULTILINE)
+              if single.search(content):
+                  content = single.sub(f'{map_name} = {{\n{new_entry}\n}}', content)
+                  print(f'  Added {key} to {map_name} (expanded empty map)')
+                  return content
+              if not re.search(rf'^\s*{re.escape(map_name)}\s*=\s*\{{', content, re.MULTILINE):
+                  content = content.rstrip('\n') + f'\n\n{map_name} = {{\n{new_entry}\n}}\n'
+                  print(f'  Added {key} to {map_name} (new map)')
+                  return content
+              lines = content.splitlines(keepends=True)
+              in_map, depth = False, 0
+              for i, line in enumerate(lines):
+                  stripped = line.strip()
+                  if not in_map:
+                      if re.match(rf'\s*{re.escape(map_name)}\s*=\s*\{{', line):
+                          in_map = True
+                          depth = stripped.count('{') - stripped.count('}')
+                  else:
+                      depth += stripped.count('{') - stripped.count('}')
+                      if depth == 0:
+                          lines.insert(i, new_entry + '\n')
+                          print(f'  Added {key} to {map_name}')
+                          break
+              return ''.join(lines)
+
+          content = insert_into_map(content, 'firewall_rules', rule_entry, rule_key)
+          open(path, 'w').write(content)
+          print('terraform.tfvars updated.')
+          PYEOF
+          terraform fmt "${{ github.workspace }}/environments/${ENVIRONMENT}/terraform.tfvars"
+      - name: commit and push terraform.tfvars
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "${{ github.workspace }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git add "environments/${ENVIRONMENT}/terraform.tfvars"
+          if git diff --cached --quiet; then
+            echo "No changes — firewall rule entry already present in terraform.tfvars."
+          else
+            git commit -m "[skip ci] add firewall rule ${RULE_NAME} to ${ENVIRONMENT}/terraform.tfvars"
+            git pull --rebase
+            git push
+            echo "Pushed terraform.tfvars update."
+          fi
